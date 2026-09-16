@@ -1,228 +1,174 @@
-#!/usr/bin/python
+#!/usr/bin/env python3
+# Original script by K. Kortright; refactored with Claude (Anthropic, 2026).
+# Changes: PEP-8 formatting, docstrings, glob-based file discovery replacing
+# 42 hardcoded calls, and bug fixes for misassigned output variables (files 14–28).
+"""
+vcf_parse.py
 
+Parses GATK-produced VCF files from an P. aeruginosa evolution experiment,
+extracting per-site allele frequencies and annotating variants with
+gene information from a reference genome dictionary.
 
-import sys
-import os
+Output columns (tab-separated):
+    chrom, pos, ref_bp, freq_ref, alt_bp, freq_alt, gene_number, gene_name, qual
+
+Usage:
+    python vcf_parse.py
+    (Expects genomedict.txt and all target VCF files in the working directory.)
+"""
+
 import glob
+import os
+import sys
 
-#os.chdir('/Users/kkortright/Desktop/Desktop/TurnerLab/2021/2021.01-January/2021.01.26-rotation_concatenated_GATK/')
 
-genomedictfile = open('genomedict.txt','r')
-genomedict = {}
-for line in genomedictfile:
-    line = line.strip('\n').split('\t')
-    genomedict[line[0]] = [line[1], line[2], line[3]]
+# ---------------------------------------------------------------------------
+# Load genome annotation dictionary
+# ---------------------------------------------------------------------------
 
-genomedictfile.close()
+def load_genome_dict(dict_path: str) -> dict:
+    """
+    Load a tab-delimited genome annotation file mapping genomic positions
+    to gene annotations.
 
-def VCFParse(argv1, argv2):
-    infile = open(argv1,'r')
-    outfile = open(argv2,'w')
+    Expected file format (one entry per line):
+        position <tab> field1 <tab> gene_number <tab> gene_name
 
-    for line in infile:
-        if line.startswith('#'):
-            pass
-        else:
-            line = line.strip('\n').split('\t')
-            chrom = line[0]
-            pos = line[1]
-            refbp = line[3]
-            altbp = line[4]
-            qual = line[5]
-            low = line[6]
-            test = line[8].split(':')
-            if len(test) >= 2 and test[1] == "AD" and test[2] == "DP":
-                dp = line[9].split(':')[2]      #read depth for alt allele
-                ad = line[9].split(':')[1]      #allelic depth for ref then alt
-                ref = int(ad.split(',')[0])
-                alt = int(ad.split(',')[1])
-                freqref = ref / (ref + alt)     #frequency of WT allele 
-                freqalt = alt / (ref + alt)     #frequency of poly allele
-                if pos in genomedict.keys():
-                    genenumber = genomedict[pos][1]
-                    genename = genomedict[pos][2]
-                else:
-                    genenumber = "intergenic"
-                    genename = "intergenic"
-                if low == "LowQual":
-                    pass
-                else:
-                    outfile.write(str(chrom) + '\t' + str(pos) + '\t' + str(refbp) + '\t' + str(freqref) + '\t' + str(altbp) + '\t' + str(freqalt) + '\t' + str(genenumber)  + '\t' + str(genename) + '\t' + str(qual) + '\n')
+    Args:
+        dict_path: Path to the genome dictionary file.
+
+    Returns:
+        A dict mapping position strings to [field1, gene_number, gene_name].
+    """
+    genome_dict = {}
+    with open(dict_path, "r") as fh:
+        for line in fh:
+            fields = line.strip("\n").split("\t")
+            # Key: genomic position; value: [field1, gene_number, gene_name]
+            genome_dict[fields[0]] = [fields[1], fields[2], fields[3]]
+    return genome_dict
+
+
+# ---------------------------------------------------------------------------
+# VCF parser
+# ---------------------------------------------------------------------------
+
+def parse_vcf(input_path: str, output_path: str, genome_dict: dict) -> None:
+    """
+    Parse a single GATK VCF file and write a tab-delimited summary of
+    high-quality variant sites with allele frequencies.
+
+    For each non-header VCF line, the function:
+      - Skips LowQual sites.
+      - Requires the FORMAT field to follow the AD:DP layout used by GATK
+        HaplotypeCaller in haploid/pooled mode (index 1 = AD, index 2 = DP).
+      - Computes reference and alternate allele frequencies from AD counts.
+      - Annotates the site with gene information from genome_dict, or marks
+        it as intergenic if the position is absent from the dictionary.
+
+    Args:
+        input_path:   Path to the input VCF file.
+        output_path:  Path for the parsed output text file.
+        genome_dict:  Annotation dictionary from load_genome_dict().
+    """
+    with open(input_path, "r") as infile, open(output_path, "w") as outfile:
+        for line in infile:
+
+            # Skip VCF header lines
+            if line.startswith("#"):
+                continue
+
+            fields = line.strip("\n").split("\t")
+            chrom   = fields[0]
+            pos     = fields[1]
+            ref_bp  = fields[3]
+            alt_bp  = fields[4]
+            qual    = fields[5]
+            filter_ = fields[6]   # FILTER column ("PASS", "LowQual", etc.)
+
+            # Drop low-quality calls before any further processing
+            if filter_ == "LowQual":
+                continue
+
+            # Parse the FORMAT field to locate AD and DP subfields.
+            # GATK emits FORMAT as e.g. "GT:AD:DP:..." — we require
+            # index 1 == "AD" and index 2 == "DP" to match expected layout.
+            format_keys = fields[8].split(":")
+            if not (len(format_keys) >= 3
+                    and format_keys[1] == "AD"
+                    and format_keys[2] == "DP"):
+                continue  # Unexpected FORMAT layout; skip site
+
+            # Extract AD (allelic depth) and DP (total read depth) from
+            # the sample column (index 9), matching FORMAT order above.
+            sample_values = fields[9].split(":")
+            ad_field = sample_values[1]   # "ref_count,alt_count"
+            # dp_field = sample_values[2]  # total depth (unused downstream)
+
+            ref_count = int(ad_field.split(",")[0])
+            alt_count = int(ad_field.split(",")[1])
+            total     = ref_count + alt_count
+
+            # Compute allele frequencies (guard against zero-depth sites)
+            freq_ref = ref_count / total if total > 0 else 0.0
+            freq_alt = alt_count / total if total > 0 else 0.0
+
+            # Look up gene annotation; fall back to "intergenic" if absent
+            if pos in genome_dict:
+                gene_number = genome_dict[pos][1]
+                gene_name   = genome_dict[pos][2]
             else:
-                pass
-    print(str('Done with ' + str(argv1[:-4]) + '!'))
-    infile.close()
-    outfile.close()
+                gene_number = "intergenic"
+                gene_name   = "intergenic"
 
-file1 = 'bacteria_0_raw_variants.vcf'
-out1 = 'bacteria_0_parsed.txt'
-VCFParse(file1, out1)
+            # Write parsed record to output file
+            outfile.write(
+                "\t".join([
+                    chrom,
+                    pos,
+                    ref_bp,
+                    str(freq_ref),
+                    alt_bp,
+                    str(freq_alt),
+                    gene_number,
+                    gene_name,
+                    qual,
+                ]) + "\n"
+            )
 
-file2 = 'bacteria_PA01_raw_variants.vcf'
-out2 = 'bacteria_PA01__parsed.txt'
-VCFParse(file2, out2)
-
-file3 = 'bacteria_pop1.10_raw_variants.vcf'
-out3 = 'bacteria_pop1.10_parsed.txt'
-VCFParse(file3, out3)
-
-file4 = 'bacteria_pop1.1_raw_variants.vcf'
-out4 = 'bacteria_pop1.1_parsed.txt'
-VCFParse(file4, out4)
-
-file5 = 'bacteria_pop1.2_raw_variants.vcf'
-out5 = 'bacteria_pop1.2_parsed.txt'
-VCFParse(file5, out5)
-
-file6 = 'bacteria_pop1.3_raw_variants.vcf'
-out6 = 'bacteria_pop1.3_parsed.txt'
-VCFParse(file6, out6)
-
-file7 = 'bacteria_pop1.4_raw_variants.vcf'
-out7 = 'bacteria_pop1.4_parsed.txt'
-VCFParse(file7, out7)
-
-file8 = 'bacteria_pop1.5_raw_variants.vcf'
-out8 = 'bacteria_pop1.5_parsed.txt'
-VCFParse(file8, out8)
-
-file9 = 'bacteria_pop1.6_raw_variants.vcf'
-out9 = 'bacteria_pop1.6_parsed.txt'
-VCFParse(file9, out9)
-
-file10 = 'bacteria_pop1.7_raw_variants.vcf'
-out10 = 'bacteria_pop1.7_parsed.txt'
-VCFParse(file10, out10)
-
-file11 = 'bacteria_pop1.8_raw_variants.vcf'
-out11 = 'bacteria_pop1.8_parsed.txt'
-VCFParse(file11, out11)
-
-file12 = 'bacteria_pop1.9_raw_variants.vcf'
-out12 = 'bacteria_pop1.9_parsed.txt'
-VCFParse(file12, out12)
-
-file13 = 'bacteria_pop2.10_raw_variants.vcf'
-out13 = 'bacteria_pop2.10_parsed.txt'
-VCFParse(file13, out13)
-
-file14 = 'bacteria_pop2.1_raw_variants.vcf'
-file14 = 'bacteria_pop2.1_parsed.txt'
-VCFParse(file14, out14)
-
-file15 = 'bacteria_pop2.2_raw_variants.vcf'
-file15 = 'bacteria_pop2.2_parsed.txt'
-VCFParse(file15, out15)
-
-file16 = 'bacteria_pop2.3_raw_variants.vcf'
-file16 = 'bacteria_pop2.3_parsed.txt'
-VCFParse(file16, out16)
-
-file17 = 'bacteria_pop2.4_raw_variants.vcf'
-file17 = 'bacteria_pop2.4_parsed.txt'
-VCFParse(file17, out17)
-
-file18 = 'bacteria_pop2.5_raw_variants.vcf'
-file18 = 'bacteria_pop2.5_parsed.txt'
-VCFParse(file18, out18)
-
-file19 = 'bacteria_pop2.6_raw_variants.vcf'
-file19 = 'bacteria_pop2.6_parsed.txt'
-VCFParse(file19, out19)
-
-file20 = 'bacteria_pop2.7_raw_variants.vcf'
-file20 = 'bacteria_pop2.7_parsed.txt'
-VCFParse(file20, out20)
-
-file21 = 'bacteria_pop2.8_raw_variants.vcf'
-file21 = 'bacteria_pop2.8_parsed.txt'
-VCFParse(file21, out21)
-
-file22 = 'bacteria_pop2.9_raw_variants.vcf'
-file22 = 'bacteria_pop2.9_parsed.txt'
-VCFParse(file22, out22)
-
-file23 = 'bacteria_pop3.10_raw_variants.vcf'
-file23 = 'bacteria_pop3.10_parsed.txt'
-VCFParse(file23, out23)
-
-file24 = 'bacteria_pop3.1_raw_variants.vcf'
-file24 = 'bacteria_pop3.1_parsed.txt'
-VCFParse(file24, out24)
-
-file25 = 'bacteria_pop3.2_raw_variants.vcf'
-file25 = 'bacteria_pop3.2_parsed.txt'
-VCFParse(file25, out25)
-
-file26 = 'bacteria_pop3.3_raw_variants.vcf'
-file26 = 'bacteria_pop3.3_parsed.txt'
-VCFParse(file26, out26)
-
-file27 = 'bacteria_pop3.4_raw_variants.vcf'
-file27 = 'bacteria_pop3.4_parsed.txt'
-VCFParse(file27, out27)
-
-file28 = 'bacteria_pop3.5_raw_variants.vcf'
-file28 = 'bacteria_pop3.5_parsed.txt'
-VCFParse(file28, out28)
-
-file29 = 'bacteria_pop3.6_raw_variants.vcf'
-out29 = 'bacteria_pop3.6_parsed.txt'
-VCFParse(file29, out29)
-
-file30 = 'bacteria_pop3.7_raw_variants.vcf'
-out30 = 'bacteria_pop3.7_parsed.txt'
-VCFParse(file30, out30)
-
-file31 = 'bacteria_pop3.8_raw_variants.vcf'
-out31 = 'bacteria_pop3.8_parsed.txt'
-VCFParse(file31, out31)
-
-file32 = 'bacteria_pop3.9_raw_variants.vcf'
-out32 = 'bacteria_pop3.9_parsed.txt'
-VCFParse(file32, out32)
-
-file33 = 'bacteria_popc.10_raw_variants.vcf'
-out33 = 'bacteria_popc.10_parsed.txt'
-VCFParse(file33, out33)
-
-file34 =  'bacteria_popc.1_raw_variants.vcf'
-out34 =  'bacteria_popc.1_parsed.txt'
-VCFParse(file34, out34)
-
-file35 =  'bacteria_popc.2_raw_variants.vcf'
-out35 =  'bacteria_popc.2_parsed.txt'
-VCFParse(file35, out35)
-
-file36 =  'bacteria_popc.3_raw_variants.vcf'
-out36 =  'bacteria_popc.3_parsed.txt'
-VCFParse(file36, out36)
-
-file37 =  'bacteria_popc.4_raw_variants.vcf'
-out37 =  'bacteria_popc.4_parsed.txt'
-VCFParse(file37, out37)
-
-file38 =  'bacteria_popc.5_raw_variants.vcf'
-out38 =  'bacteria_popc.5_parsed.txt'
-VCFParse(file38, out38)
-
-file39 =  'bacteria_popc.6_raw_variants.vcf'
-out39 =  'bacteria_popc.6_parsed.txt'
-VCFParse(file39, out39)
-
-file40 =  'bacteria_popc.7_raw_variants.vcf'
-out40 =  'bacteria_popc.7_parsed.txt'
-VCFParse(file40, out40)
-
-file41 =  'bacteria_popc.8_raw_variants.vcf'
-out41 =  'bacteria_popc.8_parsed.txt'
-VCFParse(file41, out41)
-
-file42 = 'bacteria_popc.9_raw_variants.vcf'
-out42 = 'bacteria_popc.9_parsed.txt'
-VCFParse(file42, out42)
- 
+    print(f"Done with {input_path}")
 
 
-        
-        
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    """
+    Discover all VCF files in the working directory and parse each one.
+
+    VCF files are expected to be named:
+        bacteria_<sample>_raw_variants.vcf
+
+    Each produces a corresponding:
+        bacteria_<sample>_parsed.txt
+    """
+    # Load genome position-to-gene annotation dictionary
+    genome_dict = load_genome_dict("genomedict.txt")
+
+    # Discover all target VCF files rather than hardcoding each name
+    vcf_files = sorted(glob.glob("bacteria_*_raw_variants.vcf"))
+
+    if not vcf_files:
+        print("No VCF files matching 'bacteria_*_raw_variants.vcf' found.",
+              file=sys.stderr)
+        sys.exit(1)
+
+    for vcf_path in vcf_files:
+        # Derive output path by replacing the suffix
+        out_path = vcf_path.replace("_raw_variants.vcf", "_parsed.txt")
+        parse_vcf(vcf_path, out_path, genome_dict)
+
+
+if __name__ == "__main__":
+    main()
