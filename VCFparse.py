@@ -3,7 +3,7 @@
 # Changes: PEP-8 formatting, docstrings, glob-based file discovery replacing
 # 42 hardcoded calls, and bug fixes for misassigned output variables (files 14–28).
 """
-vcf_parse.py
+VCFparse.py
 
 Parses GATK-produced VCF files from an P. aeruginosa evolution experiment,
 extracting per-site allele frequencies and annotating variants with
